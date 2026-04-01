@@ -195,6 +195,119 @@ CURRENT_COINS = list(COIN_SYMBOLS)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+HUB_DATA_DIR = os.environ.get("POWERTRADER_HUB_DIR", os.path.join(BASE_DIR, "hub_data"))
+os.makedirs(HUB_DATA_DIR, exist_ok=True)
+LTH_EMA200_PATH = os.path.join(HUB_DATA_DIR, "lth_daily_ema200.json")
+
+_last_lth_ema_write_ts = 0.0
+
+def _load_long_term_symbols_from_settings() -> list:
+	"""Read long_term_holdings (symbols only) from gui_settings.json."""
+	try:
+		if not os.path.isfile(_GUI_SETTINGS_PATH):
+			return []
+		with open(_GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
+			data = json.load(f) or {}
+	except Exception:
+		data = {}
+	lth = data.get("long_term_holdings", []) or []
+	if isinstance(lth, str):
+		lth = [x.strip() for x in lth.replace("\n", ",").split(",")]
+	if not isinstance(lth, (list, tuple)):
+		lth = []
+	out = []
+	seen = set()
+	for v in lth:
+		s = str(v).upper().strip()
+		if not s or s in seen:
+			continue
+		seen.add(s)
+		out.append(s)
+	return out
+
+def _ema(values: list, period: int):
+	try:
+		vals = [float(x) for x in values if x is not None]
+	except Exception:
+		return None
+	if len(vals) < period:
+		return None
+	alpha = 2.0 / (period + 1.0)
+	ema = sum(vals[:period]) / float(period)
+	for v in vals[period:]:
+		ema = (v * alpha) + (ema * (1.0 - alpha))
+	return float(ema)
+
+def _compute_daily_ema200(sym: str):
+	"""
+	Return (ema200, price_used, pct_from_ema) for SYM.
+
+	- EMA200 is computed from daily kline closes (Kucoin 1day data).
+	- pct_from_ema is computed using CURRENT price when available (Robinhood current ask),
+	  falling back to the most recent daily close if current price is unavailable.
+	"""
+	sym_u = str(sym).upper().strip()
+	coin = sym_u + "-USDT"
+
+	# --- get daily closes for EMA200 ---
+	try:
+		history = market.get_kline(coin, "1day")
+	except Exception:
+		return None, None, None
+
+	closes = []
+	try:
+		for row in history:
+			if row and len(row) >= 3:
+				closes.append(float(row[2]))
+	except Exception:
+		closes = []
+
+	if not closes:
+		return None, None, None
+
+	closes_rev = list(reversed(closes))
+	ema200 = _ema(closes_rev, 200)
+
+	# --- choose price to compare against EMA200 ---
+	last_close = float(closes_rev[-1]) if closes_rev else None
+	price_used = last_close
+
+	# Prefer current Robinhood ask for pct calc (matches what trader actually pays on buys)
+	try:
+		rh_symbol = f"{sym_u}-USD"
+		price_used = float(robinhood_current_ask(rh_symbol))
+	except Exception:
+		price_used = last_close
+
+	if ema200 is None or price_used is None or float(ema200) <= 0.0:
+		return ema200, price_used, None
+
+	pct = (float(price_used) - float(ema200)) / float(ema200) * 100.0
+	return float(ema200), float(price_used), float(pct)
+
+
+def _write_lth_ema200_snapshot() -> None:
+	global _last_lth_ema_write_ts
+	now = time.time()
+	if (now - float(_last_lth_ema_write_ts)) < 5.0:
+		return
+	_last_lth_ema_write_ts = now
+	syms = _load_long_term_symbols_from_settings()
+	coins = {}
+	for sym in syms:
+		ema200, price, pct = _compute_daily_ema200(sym)
+		if ema200 is None or price is None:
+			continue
+		coins[sym] = {"ema200": ema200, "price": price, "pct_from_ema200": pct}
+	payload = {"ts": now, "coins": coins}
+	try:
+		with open(LTH_EMA200_PATH, "w", encoding="utf-8") as f:
+			json.dump(payload, f)
+	except Exception:
+		pass
+
+
 def coin_folder(sym: str) -> str:
 	sym = sym.upper()
 	# Your "main folder is BTC folder" convention:
@@ -1097,7 +1210,11 @@ try:
 		# Hot-reload coins from GUI settings while running
 		_sync_coins_from_settings()
 
+		# Continuously compute daily 200 EMA for long-term coins and publish to trader
+		_write_lth_ema200_snapshot()
+
 		for _sym in CURRENT_COINS:
+
 			step_coin(_sym)
 
 		# clear + re-print one combined screen (so you don't see old output above new)
