@@ -322,7 +322,7 @@ DEFAULT_SETTINGS = {
     "start_allocation_pct": 0.5,
 
     "dca_multiplier": 2.0,
-    "dca_levels": [-5.0, -10.0, -20.0, -30.0, -40.0, -50.0N -50.0],
+    "dca_levels": [-5.0, -10.0, -20.0, -30.0, -40.0, -50.0, -50.0],
     "max_dca_buys_per_24h": 1,
 
     # --- Trailing PM settings (editable; hot-reload friendly) ---
