@@ -1841,6 +1841,8 @@ class PowerTraderHub(tk.Tk):
 
         # Visible coin-chart refresh is prepared off the Tk thread, then applied on the Tk thread.
         # This keeps hover/click/scroll responsive while data/network/file work happens.
+        # IMPORTANT: only allow one visible-chart worker at a time. Otherwise timed refreshes
+        # can stack background workers and the hub's RAM can balloon.
         self._chart_refresh_lock = threading.Lock()
         self._chart_refresh_request_id = 0
         self._chart_refresh_inflight_id = 0
@@ -1849,8 +1851,10 @@ class PowerTraderHub(tk.Tk):
         # Account-value chart refresh is also prepared off the Tk thread.
         # The old code rebuilt/parsing the entire account-value history on the Tk thread,
         # which is what caused the periodic UI stalls.
+        # IMPORTANT: only allow one account-chart worker at a time for the same reason.
         self._account_chart_refresh_lock = threading.Lock()
         self._account_chart_refresh_request_id = 0
+        self._account_chart_refresh_inflight_id = 0
         self._account_chart_refresh_result: Optional[dict] = None
 
         self._build_menu()
@@ -4410,6 +4414,13 @@ class PowerTraderHub(tk.Tk):
             self._chart_refresh_request_id += 1
             req_id = self._chart_refresh_request_id
 
+            # Do not stack multiple background refresh workers.
+            # Keep only the latest requested id and let the next tick launch again.
+            if self._chart_refresh_inflight_id:
+                return
+
+            self._chart_refresh_inflight_id = req_id
+
         t = threading.Thread(
             target=self._chart_refresh_worker,
             args=(req_id, coin, buy_px, sell_px, trail_line, dca_line_price, avg_cost_basis),
@@ -4427,11 +4438,13 @@ class PowerTraderHub(tk.Tk):
         dca_line_price: Optional[float],
         avg_cost_basis: Optional[float],
     ) -> None:
-        chart = self.charts.get(coin)
-        if not chart:
-            return
+        payload: Optional[dict] = None
 
         try:
+            chart = self.charts.get(coin)
+            if not chart:
+                return
+
             payload = chart.preload_refresh_data(
                 getattr(self, "chart_coin_folders", self.coin_folders),
                 current_buy_price=buy_px,
@@ -4441,16 +4454,19 @@ class PowerTraderHub(tk.Tk):
                 avg_cost_basis=avg_cost_basis,
             )
         except Exception:
-            return
-
-        with self._chart_refresh_lock:
-            if req_id < self._chart_refresh_request_id:
-                return
-            self._chart_refresh_result = {
-                "request_id": req_id,
-                "coin": coin,
-                "payload": payload,
-            }
+            payload = None
+        finally:
+            with self._chart_refresh_lock:
+                try:
+                    if isinstance(payload, dict) and req_id >= self._chart_refresh_request_id:
+                        self._chart_refresh_result = {
+                            "request_id": req_id,
+                            "coin": coin,
+                            "payload": payload,
+                        }
+                finally:
+                    if self._chart_refresh_inflight_id == req_id:
+                        self._chart_refresh_inflight_id = 0
 
     def _apply_pending_chart_refresh(self) -> None:
         result = None
@@ -4495,6 +4511,13 @@ class PowerTraderHub(tk.Tk):
             self._account_chart_refresh_request_id += 1
             req_id = self._account_chart_refresh_request_id
 
+            # Do not stack multiple background refresh workers.
+            # Keep only the latest requested id and let the next tick launch again.
+            if self._account_chart_refresh_inflight_id:
+                return
+
+            self._account_chart_refresh_inflight_id = req_id
+
         t = threading.Thread(
             target=self._account_chart_refresh_worker,
             args=(req_id,),
@@ -4503,25 +4526,27 @@ class PowerTraderHub(tk.Tk):
         t.start()
 
     def _account_chart_refresh_worker(self, req_id: int) -> None:
-        chart = self.account_chart
-        if not chart:
-            return
+        payload: Optional[dict] = None
 
         try:
+            chart = self.account_chart
+            if not chart:
+                return
+
             payload = chart.preload_refresh_data()
         except Exception:
-            return
-
-        if not isinstance(payload, dict):
-            return
-
-        with self._account_chart_refresh_lock:
-            if req_id < self._account_chart_refresh_request_id:
-                return
-            self._account_chart_refresh_result = {
-                "request_id": req_id,
-                "payload": payload,
-            }
+            payload = None
+        finally:
+            with self._account_chart_refresh_lock:
+                try:
+                    if isinstance(payload, dict) and req_id >= self._account_chart_refresh_request_id:
+                        self._account_chart_refresh_result = {
+                            "request_id": req_id,
+                            "payload": payload,
+                        }
+                finally:
+                    if self._account_chart_refresh_inflight_id == req_id:
+                        self._account_chart_refresh_inflight_id = 0
 
     def _apply_pending_account_chart_refresh(self) -> None:
         result = None
